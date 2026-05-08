@@ -13,6 +13,7 @@ import {
 	appendTransactionMessageInstruction,
 	signTransactionMessageWithSigners,
 	getSignatureFromTransaction,
+	getBase64EncodedWireTransaction,
 	sendAndConfirmTransactionFactory,
 	lamports,
 	devnet,
@@ -50,6 +51,12 @@ async function loadKeypair() {
 	const keyPair = await createKeyPairSignerFromBytes(secretKeyBytes);
 	return keyPair;
 }
+function statusUpdate(message) {
+	process.stdout.clearLine(0);
+	process.stdout.cursorTo(0);
+	process.stdout.write(message);
+}
+
 
 // --- Main function ---
 async function main() {
@@ -80,36 +87,86 @@ async function main() {
 		process.exit(1);
 	}
 
-	// 4. Build the transaction
+	const COMMITMENT_LEVELS = ["processed", "confirmed", "finalized"];
+
+async function waitForCommitment(rpc, signature, targetCommitment) {
+	const targetIndex = COMMITMENT_LEVELS.indexOf(targetCommitment);
+
+	while (true) {
+		const { value } = await rpc
+			.getSignatureStatuses([signature], { searchTransactionHistory: true })
+			.send();
+
+		const status = value[0];
+
+		if (status?.err) {
+			throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.err)}`);
+		}
+
+		if (status) {
+			const currentIndex = COMMITMENT_LEVELS.indexOf(status.confirmationStatus);
+			if (currentIndex >= targetIndex) break;
+		}
+
+		await new Promise((r) => setTimeout(r, 500));
+	}
+}
+
+async function transferWithConfirmation(rpc, signer, toAddress, amountInSOL) {
+	const destination = address(toAddress);
+	const lamportAmount = lamports(BigInt(Math.round(amountInSOL * 1_000_000_000)));
+
 	const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
 
 	const transactionMessage = pipe(
 		createTransactionMessage({ version: 0 }),
-		(tx) => setTransactionMessageFeePayerSigner(sender, tx),
+		(tx) => setTransactionMessageFeePayerSigner(signer, tx),
 		(tx) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, tx),
-		(tx) =>
-			appendTransactionMessageInstruction(
+		(tx) =>	appendTransactionMessageInstruction(
 				getTransferSolInstruction({
-					source: sender,
-					destination: recipientAddress,
-					amount: transferLamports,
+					source: signer,
+					destination,
+					amount: lamportAmount,
 				}),
 				tx
 			)
 	);
 
-	// 5. Sign the transaction
 	const signedTransaction = await signTransactionMessageWithSigners(transactionMessage);
 	const signature = getSignatureFromTransaction(signedTransaction);
+	const wireTransaction = getBase64EncodedWireTransaction(signedTransaction);
 
-	// 6. Send and confirm
-	console.log("\nSending transaction...");
-	const sendAndConfirm = sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions });
-	await sendAndConfirm(signedTransaction, { commitment: "confirmed" });
+	console.log(`\nSending ${amountInSOL} SOL to ${toAddress}...\n`);
 
-	console.log("Transaction confirmed!\n");
-	console.log("Signature:", signature);
-	console.log(`Explorer:  https://explorer.solana.com/tx/${signature}?cluster=devnet`);
+	// Step A: Send the transaction
+	statusUpdate("Status: Sending transaction...");
+	await rpc.sendTransaction(wireTransaction, { encoding: "base64" }).send();
+
+	statusUpdate("Status: Processed (included in a block)...");
+
+	// Step B: Wait for confirmed status
+	await waitForCommitment(rpc, signature, "confirmed");
+	statusUpdate("Status: Confirmed (supermajority voted)...");
+
+	// Step C: Wait for finalized status
+	await waitForCommitment(rpc, signature, "finalized");
+	statusUpdate("Status: Finalized (irreversible)");
+
+	console.log("\n");
+
+	return signature;
+}
+try {
+	const signature = await transferWithConfirmation(rpc, sender, recipientAddress, solAmount);
+	console.log("Transaction successful!");
+	console.log(`Signature: ${signature}`);
+	console.log(`View on Solana Explorer:`);
+	console.log(`https://explorer.solana.com/tx/${signature}?cluster=devnet`);
+} catch (error) {
+	console.error("\nTransaction failed:");
+	console.error(error.message);
+	process.exit(1);
+}
 
 	// 7. Show updated balance
 	const { value: newBalance } = await rpc.getBalance(sender.address).send();
