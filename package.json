@@ -9,7 +9,9 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@solana/kit": "^6.8.0"
+    "@solana-program/token": "^0.13.0",
+    "@solana/kit": "^6.9.0"
   },
-  "description": ""
+  "description": "",
+  "type": "module"
 }
